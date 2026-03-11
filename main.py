@@ -150,7 +150,10 @@ def compute_pe_series(ticker_obj, annual_price: pd.Series, info: dict):
     current_eps   = info.get("trailingEps") or (float(eps_s.iloc[-1]) if not eps_s.empty else None)
     current_price = float(info.get("currentPrice") or info.get("regularMarketPrice") or 0)
     cur_multiple  = round(current_price / float(current_eps), 1) if current_eps and current_eps > 0 else info.get("trailingPE")
-    cur_fv        = round(float(current_eps) * avg_multiple, 2) if current_eps and current_eps > 0 else None
+
+    # Juste valeur courante = dernier point de la série (cohérence garantie avec le graphique)
+    last_year_fv = fv_series.get(max(fv_series.keys())) if fv_series else None
+    cur_fv = last_year_fv
 
     return {"metric":"pe","metric_label":"P/E","avg_multiple":avg_multiple,
             "current_multiple":cur_multiple,"current_fv":cur_fv,
@@ -199,10 +202,10 @@ def compute_evebitda_series(ticker_obj, annual_price: pd.Series, info: dict):
 
     cur_ebitda   = info.get("ebitda")
     cur_ev_eb    = info.get("enterpriseToEbitda")
-    cur_fv       = None
-    if cur_ebitda and cur_ebitda > 0:
-        fv_eq = (float(cur_ebitda) * avg_multiple - net_debt) / shares
-        cur_fv = round(fv_eq, 2) if fv_eq > 0 else None
+
+    # Juste valeur courante = dernier point de la série (cohérence avec le graphique)
+    last_year_fv = fv_series.get(max(fv_series.keys())) if fv_series else None
+    cur_fv = last_year_fv
 
     return {"metric":"evebitda","metric_label":"EV/EBITDA","avg_multiple":avg_multiple,
             "current_multiple":round(float(cur_ev_eb),1) if cur_ev_eb else None,
@@ -222,6 +225,99 @@ def build_chart_data(fv_series: dict, annual_price: pd.Series) -> dict:
             "lower_band":[round(v*0.85,2) for v in fvs]}
 
 
+def compute_fcf_series(ticker_obj, annual_price: pd.Series, info: dict):
+    """Price/FCF historique : cours / (Free Cash Flow par action)."""
+    try:
+        cf = ticker_obj.cashflow
+        # FCF = Operating Cash Flow - CapEx
+        if "Operating Cash Flow" in cf.index and "Capital Expenditure" in cf.index:
+            fcf_s = cf.loc["Operating Cash Flow"] + cf.loc["Capital Expenditure"]  # CapEx est négatif
+        elif "Free Cash Flow" in cf.index:
+            fcf_s = cf.loc["Free Cash Flow"]
+        else:
+            return None
+        fcf_s.index = pd.to_datetime(fcf_s.index).year
+        fcf_s = fcf_s.sort_index()
+    except Exception:
+        return None
+
+    shares = info.get("sharesOutstanding", 1)
+    fcf_per_share = fcf_s / shares
+
+    pfcf_series = {}
+    for year in annual_price.index:
+        if year in fcf_per_share.index and fcf_per_share[year] and fcf_per_share[year] > 0:
+            pfcf_series[year] = round(float(annual_price[year]) / float(fcf_per_share[year]), 1)
+
+    if len(pfcf_series) < 3:
+        return None
+    avg_multiple = round(float(np.mean(list(pfcf_series.values()))), 1)
+
+    fv_series = {}
+    for year, fcf_ps in fcf_per_share.items():
+        if fcf_ps and fcf_ps > 0:
+            fv_series[year] = round(float(fcf_ps) * avg_multiple, 2)
+
+    current_price  = float(info.get("currentPrice") or info.get("regularMarketPrice") or 0)
+    current_fcf    = info.get("freeCashflow")
+    cur_fcf_ps     = float(current_fcf) / shares if current_fcf else None
+    cur_multiple   = round(current_price / cur_fcf_ps, 1) if cur_fcf_ps and cur_fcf_ps > 0 else None
+
+    # Juste valeur courante = dernier point de la série
+    last_year_fv = fv_series.get(max(fv_series.keys())) if fv_series else None
+    cur_fv = last_year_fv
+
+    return {"metric":"fcf","metric_label":"Price/FCF","avg_multiple":avg_multiple,
+            "current_multiple":cur_multiple,"current_fv":cur_fv,
+            "fair_value_series":fv_series,"current_eps":None,
+            "multiple_series":{str(k):v for k,v in pfcf_series.items()}}
+
+
+def compute_dividend_data(ticker_obj, annual_price: pd.Series, info: dict) -> dict:
+    """
+    Retourne les dividendes annuels par action et le rendement historique.
+    Utilisé pour l'onglet Dividende ET pour les barres sur le graphique principal.
+    """
+    try:
+        divs = ticker_obj.dividends
+        if divs.empty:
+            return None
+        divs.index = pd.to_datetime(divs.index)
+        # Convertit en timezone-naive si nécessaire
+        if divs.index.tz is not None:
+            divs.index = divs.index.tz_localize(None)
+        divs_annual = divs.groupby(divs.index.year).sum()
+    except Exception:
+        return None
+
+    if divs_annual.empty:
+        return None
+
+    # Rendement annuel = dividende / cours fin d'année
+    yield_series = {}
+    for year in divs_annual.index:
+        if year in annual_price.index and annual_price[year] > 0:
+            yield_series[year] = round(float(divs_annual[year]) / float(annual_price[year]) * 100, 2)
+
+    current_div_rate = info.get("dividendRate") or info.get("trailingAnnualDividendRate") or 0
+    current_yield    = info.get("dividendYield") or info.get("trailingAnnualDividendYield") or 0
+    payout_ratio     = info.get("payoutRatio")
+
+    # Série pour barres graphique : {année: dividende_par_action}
+    div_bars = {str(int(y)): round(float(v), 4) for y, v in divs_annual.items()
+                if y in annual_price.index}
+
+    return {
+        "has_dividend":      True,
+        "current_div_rate":  round(float(current_div_rate), 4) if current_div_rate else 0,
+        "current_yield_pct": round(float(current_yield) * 100, 2) if current_yield else 0,
+        "payout_ratio":      round(float(payout_ratio) * 100, 1) if payout_ratio else None,
+        "div_bars":          div_bars,          # pour barres sur graphique principal
+        "yield_series":      {str(int(k)): v for k, v in yield_series.items()},
+        "div_annual":        {str(int(y)): round(float(v), 4) for y, v in divs_annual.items()},
+    }
+
+
 def compute_stock_data(ticker_obj, years: int) -> dict:
     info          = ticker_obj.info
     profile       = detect_profile(info)
@@ -234,6 +330,8 @@ def compute_stock_data(ticker_obj, years: int) -> dict:
 
     pe_data       = compute_pe_series(ticker_obj, annual_price, info)
     evebitda_data = compute_evebitda_series(ticker_obj, annual_price, info)
+    fcf_data      = compute_fcf_series(ticker_obj, annual_price, info)
+    div_data      = compute_dividend_data(ticker_obj, annual_price, info)
 
     # Sélection de la métrique principale selon le profil
     if profile["metric"] == "evebitda" and evebitda_data:
@@ -272,9 +370,11 @@ def compute_stock_data(ticker_obj, years: int) -> dict:
         "current_eps":      pe_data["current_eps"] if pe_data else None,
         # Chart (métrique principale)
         **chart,
-        # Données brutes des deux métriques pour les onglets
+        # Données brutes des métriques pour les onglets
         "pe_data":       pe_data,
         "evebitda_data": evebitda_data,
+        "fcf_data":      fcf_data,
+        "div_data":      div_data,
     }
 
 
