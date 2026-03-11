@@ -116,15 +116,26 @@ def get_annual_prices(ticker_obj, years: int) -> pd.Series:
 
 def compute_pe_series(ticker_obj, annual_price: pd.Series, info: dict):
     try:
-        fin = ticker_obj.financials
-        if "Basic EPS" in fin.index:
-            eps_s = fin.loc["Basic EPS"]
-        elif "Diluted EPS" in fin.index:
-            eps_s = fin.loc["Diluted EPS"]
-        else:
-            net_income = fin.loc["Net Income"]
-            eps_s = net_income / info.get("sharesOutstanding", 1)
-        eps_s.index = pd.to_datetime(eps_s.index).year
+        # income_stmt donne jusqu'à 4 ans, financials aussi — on prend les deux et on fusionne
+        eps_s = pd.Series(dtype=float)
+        for attr in ["income_stmt", "financials"]:
+            try:
+                fin = getattr(ticker_obj, attr)
+                if "Basic EPS" in fin.index:
+                    s = fin.loc["Basic EPS"]
+                elif "Diluted EPS" in fin.index:
+                    s = fin.loc["Diluted EPS"]
+                else:
+                    net_income = fin.loc["Net Income"]
+                    s = net_income / info.get("sharesOutstanding", 1)
+                s.index = pd.to_datetime(s.index).year
+                s = s.sort_index()
+                # Fusionne sans écraser les valeurs existantes
+                for yr, val in s.items():
+                    if yr not in eps_s.index:
+                        eps_s[yr] = val
+            except Exception:
+                continue
         eps_s = eps_s.sort_index()
     except Exception:
         eps_s = pd.Series(dtype=float)
@@ -132,15 +143,23 @@ def compute_pe_series(ticker_obj, annual_price: pd.Series, info: dict):
     pe_series = {}
     for year in annual_price.index:
         if year in eps_s.index and eps_s[year] and eps_s[year] > 0:
-            pe_series[year] = round(float(annual_price[year]) / float(eps_s[year]), 1)
+            pe = float(annual_price[year]) / float(eps_s[year])
+            # Filtre les P/E aberrants (splits non ajustés, années déficitaires proches de 0)
+            if 3 <= pe <= 120:
+                pe_series[year] = round(pe, 1)
 
     if len(pe_series) < 3:
         current_pe = info.get("trailingPE")
-        if not current_pe:
+        if not current_pe or not (3 <= current_pe <= 120):
             return None
         avg_multiple = round(float(current_pe), 1)
     else:
-        avg_multiple = round(float(np.mean(list(pe_series.values()))), 1)
+        # Moyenne robuste : exclut les 10% extrêmes si assez de points
+        vals = sorted(pe_series.values())
+        if len(vals) >= 6:
+            trim = max(1, len(vals) // 10)
+            vals = vals[trim:-trim]
+        avg_multiple = round(float(np.mean(vals)), 1)
 
     fv_series = {}
     for year, eps in eps_s.items():
@@ -183,15 +202,21 @@ def compute_evebitda_series(ticker_obj, annual_price: pd.Series, info: dict):
     for year in annual_price.index:
         if year in ebitda_s.index and ebitda_s[year] and ebitda_s[year] > 0:
             ev = float(annual_price[year]) * shares + net_debt
-            ev_series[year] = round(ev / float(ebitda_s[year]), 1)
+            ratio = ev / float(ebitda_s[year])
+            if 2 <= ratio <= 60:  # filtre les ratios aberrants
+                ev_series[year] = round(ratio, 1)
 
     if len(ev_series) < 3:
         cur_ev = info.get("enterpriseToEbitda")
-        if not cur_ev:
+        if not cur_ev or not (2 <= cur_ev <= 60):
             return None
         avg_multiple = round(float(cur_ev), 1)
     else:
-        avg_multiple = round(float(np.mean(list(ev_series.values()))), 1)
+        vals = sorted(ev_series.values())
+        if len(vals) >= 6:
+            trim = max(1, len(vals) // 10)
+            vals = vals[trim:-trim]
+        avg_multiple = round(float(np.mean(vals)), 1)
 
     fv_series = {}
     for year, ebitda in ebitda_s.items():
