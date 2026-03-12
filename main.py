@@ -48,7 +48,8 @@ TOP_UNIVERSE = {
         "AI.PA","AIR.PA","BN.PA","BNP.PA","CA.PA","CAP.PA","CS.PA","DG.PA",
         "DSY.PA","ENGI.PA","GLE.PA","HO.PA","KER.PA","LR.PA","MC.PA","ML.PA",
         "OR.PA","ORA.PA","PUB.PA","RI.PA","RMS.PA","RNO.PA","SAF.PA","SAN.PA",
-        "SGO.PA","SW.PA","TTE.PA","VIE.PA","VIV.PA","WLN.PA",
+        "SGO.PA","SW.PA","TTE.PA","VIE.PA","VIV.PA",
+        # WLN.PA exclu : valeur en détresse structurelle, P/E historique non représentatif
     ],
     "DAX": [
         "ADS.DE","ALV.DE","BAYN.DE","BMW.DE","BAS.DE","CON.DE","DB1.DE",
@@ -373,6 +374,20 @@ def compute_stock_data(ticker_obj, years: int) -> dict:
     premium_pct = round((current_price / float(current_fv) - 1) * 100, 1) if current_fv else None
     day_change  = round((current_price / prev_close - 1) * 100, 2) if prev_close else 0
 
+    # ── Détection valeur en détresse ─────────────────────────────────────────
+    warning = None
+    prices_list = list(annual_price.values)
+    if len(prices_list) >= 3:
+        high_3y  = max(prices_list[-3:])
+        drawdown = (current_price / high_3y - 1) * 100
+        if drawdown < -65:
+            warning = f"⚠️ Ce titre a chuté de {abs(drawdown):.0f}% par rapport à son plus haut des 3 dernières années. La méthode du P/E historique n'est pas fiable sur une valeur en détresse structurelle : la juste valeur affichée est probablement trompeuse."
+    current_eps_val = pe_data["current_eps"] if pe_data else None
+    if current_eps_val is not None and current_eps_val < 0:
+        warning = "⚠️ Cette entreprise est actuellement déficitaire (BPA négatif). Le P/E historique n'a pas de sens dans ce contexte : la juste valeur affichée est purement indicative et ne doit pas être utilisée comme référence d'investissement."
+    if not warning and primary.get("current_multiple") and primary["current_multiple"] > 150:
+        warning = "⚠️ Le ratio de valorisation actuel est anormalement élevé, ce qui peut indiquer des bénéfices ponctuels ou une distorsion des données. Interprétez la juste valeur avec prudence."
+
     return {
         "ticker":           info.get("symbol",""),
         "name":             clean_name(info.get("longName") or info.get("shortName","")),
@@ -400,6 +415,7 @@ def compute_stock_data(ticker_obj, years: int) -> dict:
         "evebitda_data": evebitda_data,
         "fcf_data":      fcf_data,
         "div_data":      div_data,
+        "warning":       warning,
     }
 
 
@@ -490,6 +506,16 @@ def get_top_valuations(market: str = "all", limit: int = 10):
                 continue
 
         if d.get("premium_pct") is not None:
+            # Filtre valeurs en détresse : chute >65% depuis le plus haut 3 ans,
+            # ou EPS négatif récent signalant des pertes structurelles
+            current_price = d["current_price"]
+            prices_list   = d.get("prices", [])
+            if len(prices_list) >= 3:
+                high_3y = max(prices_list[-3:])
+                drawdown = (current_price / high_3y - 1) * 100
+                if drawdown < -65:
+                    errors.append({"ticker": ticker, "error": "Exclu : chute >65% (valeur en détresse)"})
+                    continue
             results.append({
                 "ticker":           ticker,
                 "name":             d["name"],
